@@ -1,102 +1,120 @@
-from functools import lru_cache
-from typing import Protocol
-from app.utils.logging import logger
-from app.core.settings.transcribe import TranscribeSettings
+import asyncio
+import random
+from typing import AsyncIterator, List, Protocol
 
-import httpx
-from openai import AsyncOpenAI
-from openai.types.audio import Transcription
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
+from deepgram import (
+    DeepgramClient,
+    DeepgramClientOptions,
+    LiveOptions,
+    LiveTranscriptionEvents,
 )
+
+from app.core.settings.base import TranscribeSettings
+from app.utils.logging import logger
+
+
+class TranscriptionServiceError(Exception):
+    """Fatal Deepgram‑related failure."""
 
 
 class TranscriptionServiceProtocol(Protocol):
-    async def transcribe(self, *, file_name: str, file_bytes: bytes, mime: str) -> str: ...
+    async def feed(self, chunk: bytes) -> None: ...
+    async def transcripts(self) -> AsyncIterator[str]: ...
+    async def stop(self) -> None: ...
 
 
-class TranscriptionServiceError(RuntimeError):
-    """Высоко‑уровневое исключение сервиса транскрибации."""
+class TranscriptionService:
+    MAX_FRAME = 8192
 
+    def __init__(self, cfg: TranscribeSettings):
+        self._cfg = cfg
 
-@lru_cache(maxsize=1)
-def _get_raw_client(settings: TranscribeSettings) -> AsyncOpenAI:
-    return AsyncOpenAI(
-        base_url=settings.base_url,
-        api_key=settings.api_key,
-        timeout=settings.timeout,
-    )
-
-
-class TranscriptionService(TranscriptionServiceProtocol):
-    DEFAULT_RETRIES = 3
-    RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
-        httpx.TimeoutException,
-        httpx.NetworkError,
-        RuntimeError,
-    )
-
-    def __init__(
-        self,
-        settings: TranscribeSettings,
-        client: AsyncOpenAI | None = None,
-        *,
-        retries: int | None = None,
-    ) -> None:
-        self._settings = settings
-        self._client: AsyncOpenAI = client or _get_raw_client(settings)
-        self._retries = retries or self.DEFAULT_RETRIES
-
-    def _retry(self):
-        return retry(
-            reraise=True,
-            stop=stop_after_attempt(self._retries),
-            wait=wait_exponential(multiplier=1, min=1, max=10),
-            retry=retry_if_exception_type(self.RETRYABLE_EXCEPTIONS),
+        self._dg = DeepgramClient(
+            cfg.api_key,
+            DeepgramClientOptions(options={
+                "keep_alive": "true",
+                "auto_flush_reply_delta": 8000,
+            }),
         )
+        self._ws = self._dg.listen.asyncwebsocket.v("1")
 
-    async def _safe_transcribe(self, *, file_name: str, file_bytes: bytes, mime: str) -> Transcription:
-        @_self_retry := self._retry()
-        async def _transcribe():
-            return await self._client.audio.transcriptions.create(
-                model=self._settings.model,
-                file=(file_name, file_bytes, mime),
-                language=self._settings.language,
-            )
+        self._q: asyncio.Queue[str | None] = asyncio.Queue(32)
+        self._buf: List[str] = []
+        self._closed = asyncio.Event()
 
-        return await _transcribe()
+        # события
+        self._ws.on(LiveTranscriptionEvents.Open, self._on_open)
+        self._ws.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
+        self._ws.on(LiveTranscriptionEvents.Close, self._on_close)
+        self._ws.on(LiveTranscriptionEvents.Error, self._on_error)
 
-    async def transcribe(
-        self,
-        *,
-        file_name: str,
-        file_bytes: bytes,
-        mime: str = "audio/ogg",
-    ) -> str:
-        logger.debug("Calling transcription: model=%s, mime=%s", self._settings.model, mime)
-        try:
-            resp: Transcription = await self._safe_transcribe(
-                file_name=file_name,
-                file_bytes=file_bytes,
-                mime=mime,
-            )
-        except Exception as exc:
-            logger.exception("Transcription request failed: %s", exc)
-            raise TranscriptionServiceError("Ошибка транскрибации аудио") from exc
+        self._opts = LiveOptions(
+            model=cfg.model,
+            language=cfg.language,
+            encoding="linear16",
+            sample_rate=cfg.sample_rate,
+            channels=cfg.channels,
+            interim_results=True,
+            vad_events=True,
+            smart_format=True,
+            endpointing=cfg.endpointing_ms,
+            utterance_end_ms=cfg.utterance_end_ms,
+        )
+        self._addons = {"no_delay": "true"}
 
-        if not getattr(resp, "text", None):
-            raise TranscriptionServiceError("Сервис не вернул текст транскрибации")
-
-        return resp.text
-
-    async def aclose(self) -> None:
-        await self._client.close()
-
-    async def __aenter__(self):  # noqa: D401
+    # --------------- контекст-менеджер ---------------
+    async def __aenter__(self):
+        await self._start()
         return self
 
-    async def __aexit__(self, exc_type, exc, tb):
-        await self.aclose()
+    async def __aexit__(self, *_):
+        await self.stop()
+
+    # ---------------- публичное API ------------------
+    async def feed(self, pcm: bytes):
+        if self._closed.is_set():
+            raise TranscriptionServiceError("stream closed")
+        for off in range(0, len(pcm), self.MAX_FRAME):
+            await self._ws.send(pcm[off:off + self.MAX_FRAME])
+
+    async def transcripts(self) -> AsyncIterator[str]:
+        while (txt := await self._q.get()) is not None:
+            yield txt
+
+    async def stop(self):
+        if not self._closed.is_set():
+            try:
+                await self._ws.send('{"type":"CloseStream"}')
+            finally:
+                await self._ws.finish()
+                await self._closed.wait()
+
+    # ------------------- внутреннее ------------------
+    async def _start(self):
+        try:
+            if await self._ws.start(self._opts, addons=self._addons):
+                return
+        except Exception as e:
+            logger.exception("DG error: %s", e)
+            raise TranscriptionServiceError("DG connect failed") from e
+
+    async def _on_open(self, _, open, **kwargs):
+        logger.debug("DG open connection")
+
+    async def _on_transcript(self, _, result, **kwargs):
+        txt = result.channel.alternatives[0].transcript
+        if not txt:
+            return
+        if result.is_final:
+            self._buf.append(txt)
+            if result.speech_final:
+                await self._q.put(" ".join(self._buf))
+                self._buf.clear()
+
+    async def _on_close(self, _, close, **kwargs):
+        await self._q.put(None)
+        self._closed.set()
+
+    async def _on_error(self, error, **_):
+        logger.exception("DG error:", error)
+        raise TranscriptionServiceError(RuntimeError(error))
