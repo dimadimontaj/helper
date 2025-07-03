@@ -1,18 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi_utils.timing import add_timing_middleware
 from contextlib import asynccontextmanager
 
 from app.core.dependencies import get_app_settings, get_keep_alive
-from app.utils.logging import logger, configure_logging, LOGGING_CONFIG
-
 from app.api.v1.transcription_router import router as transcription_router
 from app.api.v1.codetotext_router import router as codetotext_router
 from app.api.v1.getanswer_router import router as getanswer_router
-from app.middleware.logging import add_request_id
 
 
-configure_logging()
 settings = get_app_settings()
 
 
@@ -31,7 +26,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.middleware("http")(add_request_id)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.project.cors_origins,
@@ -39,12 +33,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-add_timing_middleware(
-    app,
-    record=logger.info,
-    prefix="request"
-)
-
 
 app.include_router(
     transcription_router,
@@ -71,7 +59,6 @@ def run():
         port=settings.project.port,
         reload=settings.project.debug,
         log_level="debug",
-        log_config=LOGGING_CONFIG,
     )
 
 
