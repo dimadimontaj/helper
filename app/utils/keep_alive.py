@@ -1,7 +1,7 @@
 import asyncio
 from typing import Optional
 from app.services.llm_service import LLMServiceProtocol
-from app.core.settings.base import OpenrouterSettings
+from app.core.config import OpenRouterSettings
 from app.utils.logging import logger
 from typing import Protocol
 
@@ -12,7 +12,7 @@ class KeepAliveProtocol(Protocol):
 
 
 class KeepAlive(KeepAliveProtocol):
-    def __init__(self, llm: LLMServiceProtocol, settings: OpenrouterSettings):
+    def __init__(self, llm: LLMServiceProtocol, settings: OpenRouterSettings):
         self.llm = llm
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()

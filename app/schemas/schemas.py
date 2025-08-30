@@ -12,10 +12,6 @@ class GetAnswerTheoryResponse(BaseModel):
     type: str
 
 
-class CodetotextResponse(BaseModel):
-    code: str
-
-
 class ChatMessage(TypedDict):
     role: Literal["user", "assistant", "system"]
     content: str

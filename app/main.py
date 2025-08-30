@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 
 from app.core.dependencies import get_app_settings, get_keep_alive
 from app.api.v1.transcription_router import router as transcription_router
-from app.api.v1.codetotext_router import router as codetotext_router
 from app.api.v1.getanswer_router import router as getanswer_router
 
 
@@ -38,11 +37,6 @@ app.include_router(
     transcription_router,
     prefix="/transcribe",
     tags=["transcription"],
-)
-app.include_router(
-    codetotext_router,
-    prefix="/codetotext",
-    tags=["code to text"],
 )
 app.include_router(
     getanswer_router,

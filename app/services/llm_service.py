@@ -5,7 +5,7 @@ import httpx
 from pydantic import BaseModel
 from openai import AsyncOpenAI, AsyncStream
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
-from app.core.settings.base import AppSettings, OpenrouterSettings, LLMModelsMap
+from app.core.config import AppSettings, OpenRouterSettings, LLMModelsMap
 from app.utils.logging import logger
 from tenacity import (
     retry,
@@ -36,8 +36,8 @@ class LLMServiceError(RuntimeError):
     """Высоко‑уровневая ошибка LLM‑сервиса."""
 
 
-@lru_cache(maxsize=1)
-def _get_raw_client(settings: OpenrouterSettings | None) -> AsyncOpenAI:
+@lru_cache(maxsize=8)
+def _get_raw_client(settings: OpenRouterSettings | None) -> AsyncOpenAI:
     transport = httpx.AsyncHTTPTransport(
         http2=True,
         limits=httpx.Limits(

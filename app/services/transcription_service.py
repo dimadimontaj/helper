@@ -9,7 +9,7 @@ from deepgram import (
     LiveTranscriptionEvents,
 )
 
-from app.core.settings.base import TranscribeSettings
+from app.core.config import TranscribeSettings
 from app.utils.logging import logger
 
 
